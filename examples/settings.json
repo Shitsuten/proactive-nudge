@@ -1,0 +1,9 @@
+{
+  "push": {
+    "enabled": true,
+    "conversation_id": "",
+    "message": "It has been a while since we talked. Check in naturally.",
+    "intervalMin": 30,
+    "intervalMax": 60
+  }
+}

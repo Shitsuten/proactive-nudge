@@ -1,0 +1,22 @@
+{
+  "name": "proactive-nudge",
+  "version": "0.1.0",
+  "description": "A tiny proactive nudge worker for chat apps: configurable intervals, remaining-delay scheduling, normal chat pipeline injection, and optional push notifications.",
+  "type": "module",
+  "main": "src/proactive-nudge.mjs",
+  "scripts": {
+    "start": "node src/proactive-nudge.mjs",
+    "check": "node --check src/proactive-nudge.mjs"
+  },
+  "keywords": [
+    "chatbot",
+    "proactive",
+    "nudge",
+    "web-push",
+    "sse"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
