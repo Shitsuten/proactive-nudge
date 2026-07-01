@@ -1,33 +1,47 @@
 # proactive-nudge
 
-A small proactive messaging worker for chat apps.
+一个很小的 proactive 主动消息 worker，适合接在自己的聊天应用 / AI companion / agent gateway 后面。
 
-It lets the user configure an idle interval, checks the timestamp of the last user message, injects a `[nudge]` message through the normal chat pipeline when the interval has elapsed, and optionally pushes the generated reply to a phone.
+它做的事情很简单：让用户自己设置多久没说话后触发一次提醒；后台检查最后一条用户消息的时间；到点后把一条 `[nudge]` 用户消息注入正常聊天接口；模型照常读取上下文、记忆和工具后生成回复；最后可以把回复摘要推送到手机。
 
-## Why this exists
+## 为什么要这么做
 
-Most "proactive AI" implementations are just cron jobs that send a fixed reminder. That feels wrong in chat: it interrupts active conversations, ignores context, and sounds like a notification system instead of a person.
+很多“主动找你说话”的实现其实只是 cron 定时推一句固定文案。这样很容易像闹钟：用户明明刚刚聊过，它也会硬发；模型没有上下文；发出来的东西不像真实聊天。
 
-This pattern keeps the model in the normal conversation loop:
+这个项目的思路是：**主动触发只负责制造一次对话机会，真正回复仍然走原本的聊天链路。**
 
-1. The user configures a nudge message and interval.
-2. A background worker checks the target conversation.
-3. If the last user message is too recent, the worker waits only the remaining time.
-4. If enough time has passed, the worker sends `[nudge] ...` into the regular chat endpoint.
-5. The model sees the usual system prompt, memory, tools, and history.
-6. The worker reads the SSE reply and can forward a short preview via Web Push.
+也就是说，proactive worker 不直接塞一条 assistant 消息，而是注入一条特殊的 user message：
 
-## Key ideas
+```txt
+[nudge] ...
+```
 
-- **User-configurable timing**: store `intervalMin` and `intervalMax` in backend settings.
-- **Last-user-message gate**: assistant replies do not reset the timer; only the user's latest message matters.
-- **Remaining-delay scheduling**: if the minimum interval is 50 minutes and the user spoke 33 minutes ago, wait about 17 minutes, not a full new cycle.
-- **Normal chat pipeline**: do not directly insert a fake assistant message. Inject a `[nudge]` user message and let the existing gateway generate the reply.
-- **Prompt protocol**: teach the model what `[nudge]` means in the system prompt, and tell it not to mention automation.
+然后交给原来的 gateway / model / memory / tools 去生成回复。这样模型看到的是完整上下文，前端聊天记录里也会留下完整过程。
 
-## Expected backend API
+## 核心机制
 
-The worker expects a chat backend with these endpoints:
+- **用户自定义间隔**：前端或管理面板保存 `intervalMin` / `intervalMax`，可以固定间隔，也可以随机间隔。
+- **检查最后一条用户消息**：只看最后一条 `role === "user"` 的消息时间；assistant 自己的 proactive 回复不会刷新计时器。
+- **剩余时间续等**：如果设置 50 分钟触发，但用户 33 分钟前刚说过话，worker 只会再等约 17 分钟，而不是重新等一整轮。
+- **走正常聊天入口**：到点后调用 `/gateway/send`，发送 `[nudge] ...`，让模型按正常上下文生成回复。
+- **system prompt 协议**：在 system prompt 里告诉模型 `[nudge]` 是自动定时注入，不是用户本人刚刚打字；回复时不要提系统、注入、自动。
+- **可选 Web Push**：worker 读取 SSE 回复文本后，可以把前 200 字推到手机。
+
+## 工作流程
+
+1. 用户在前端设置 proactive 开关、目标对话、注入文案、最小/最大间隔。
+2. 配置存进后端 `settings.push`。
+3. Node worker 常驻运行，定时读取配置。
+4. worker 找到目标对话；如果未指定对话，就默认选最近对话。
+5. worker 从对话历史倒序查找最后一条 user message。
+6. 如果还没到 `intervalMin`，计算剩余时间并在剩余时间后再检查。
+7. 如果已经到点，调用 `/gateway/send` 注入 `[nudge] ...`。
+8. gateway 返回 SSE，worker 收集 `content_block_delta` 文本。
+9. 如果配置了 push endpoint，就把回复摘要推送到手机。
+
+## 后端接口约定
+
+这个 worker 默认你的 chat backend 有这些接口：
 
 ```txt
 GET  /settings
@@ -36,7 +50,9 @@ GET  /conversations/:id
 POST /gateway/send
 ```
 
-`/settings` should contain:
+### `GET /settings`
+
+需要返回类似：
 
 ```json
 {
@@ -50,7 +66,33 @@ POST /gateway/send
 }
 ```
 
-`/conversations/:id` should return messages with timestamps:
+字段说明：
+
+- `enabled`：是否开启。
+- `conversation_id`：目标对话；空字符串表示使用最近对话。
+- `message`：到点后注入的 nudge 文本。
+- `intervalMin`：最短静默时间，单位分钟。
+- `intervalMax`：下一轮随机等待上限；和 `intervalMin` 相同就是固定间隔。
+
+### `GET /conversations`
+
+返回对话列表，至少需要有：
+
+```json
+[
+  {
+    "id": "conversation-id",
+    "created_at": "2026-07-01T12:00:00.000Z",
+    "updated_at": "2026-07-01T12:30:00.000Z"
+  }
+]
+```
+
+如果没有指定 `conversation_id`，worker 会按 `updated_at` / `created_at` 选择最近对话。
+
+### `GET /conversations/:id`
+
+返回对话详情，消息需要带毫秒时间戳：
 
 ```json
 {
@@ -62,7 +104,9 @@ POST /gateway/send
 }
 ```
 
-`/gateway/send` should accept a JSON body:
+### `POST /gateway/send`
+
+接受：
 
 ```json
 {
@@ -71,11 +115,20 @@ POST /gateway/send
 }
 ```
 
-and return an SSE response containing `content_block_delta` events.
+返回 SSE。当前示例代码会收集形如下面的事件：
 
-## System prompt snippet
+```json
+{
+  "type": "content_block_delta",
+  "delta": { "text": "..." }
+}
+```
 
-Add something like this to your system prompt:
+如果你的 SSE 格式不同，改 `collectAssistantTextFromSse()` 即可。
+
+## System Prompt 片段
+
+在你的 system prompt 里加类似内容：
 
 ```md
 Messages beginning with `[nudge]` are scheduled proactive prompts, not freshly typed user messages.
@@ -83,33 +136,62 @@ Messages beginning with `[nudge]` are scheduled proactive prompts, not freshly t
 When you receive one, treat it as an opportunity to naturally check in with the user using the current conversation context. Do not mention automation, scheduling, injection, system messages, or the `[nudge]` marker.
 ```
 
-## Run
+中文也可以：
+
+```md
+以 `[nudge]` 开头的用户消息是自动定时注入的，不是用户本人刚刚打字发的。收到时把它当成一次主动找用户说话的机会，根据上下文自然回复。不要提到系统、注入、自动、定时或 `[nudge]` 标记。
+```
+
+## 运行
 
 ```bash
 cp .env.example .env
 npm start
 ```
 
-For production, run it under a process manager:
+生产环境可以用 PM2：
 
 ```bash
 pm2 start src/proactive-nudge.mjs --name proactive-nudge
 pm2 save
 ```
 
-## Configuration
-
-Environment variables:
+## 环境变量
 
 ```txt
-CHAT_API              Chat backend base URL
-CHAT_API_TOKEN        Bearer token, optional if your backend is local-only
-CHAT_API_TOKEN_FILE   File containing bearer token
-PUSH_ENDPOINT         Optional push endpoint
-PUSH_TITLE            Push notification title
-PUSH_URL              URL opened from notification
-FIRST_CHECK_MS        Delay before first check
+CHAT_API              chat backend 地址
+CHAT_API_TOKEN        Bearer token；如果后端只允许本机访问，可以不用
+CHAT_API_TOKEN_FILE   存放 token 的文件路径
+PUSH_ENDPOINT         可选，Web Push 服务地址
+PUSH_TITLE            推送标题
+PUSH_URL              点击推送打开的 URL
+FIRST_CHECK_MS        第一次检查前等待多久，默认 180000
 ```
+
+## 前端怎么做
+
+前端只需要做一个设置面板，保存这些字段到 `/settings`：
+
+```json
+{
+  "push": {
+    "enabled": true,
+    "conversation_id": "",
+    "message": "收到这条说明我很久没找你了，可以自然地来找我说话。",
+    "intervalMin": 30,
+    "intervalMax": 60
+  }
+}
+```
+
+如果想让用户自己选目标对话，就从 `/conversations` 拉列表；如果不想做这么复杂，`conversation_id` 留空，让 worker 默认找最近对话也可以。
+
+## 不建议这样做
+
+- 不建议固定 cron 每隔 N 分钟直接推文案，容易打断正在聊天的人。
+- 不建议直接写入 assistant message，这样模型没机会根据上下文判断该怎么说。
+- 不建议让模型在回复里解释“这是自动提醒”，会很出戏。
+- 不建议 assistant 回复刷新 nudge 计时器，否则会变成自己和自己续命。
 
 ## License
 
